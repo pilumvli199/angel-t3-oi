@@ -356,11 +356,10 @@ def get_spot_prices(smartApi):
         return {}
 
 def format_option_chain_message(symbol, spot_price, expiry, option_data, full_data):
-    """Format option chain data for Telegram with OI, Volume, Greeks"""
+    """Format option chain data for Telegram with OI, Volume"""
     messages = []
-    messages.append(f"📊 <b>{symbol} OPTION CHAIN</b>")
-    messages.append(f"💰 Spot: ₹{spot_price:,.2f}")
-    messages.append(f"📅 Expiry: {expiry}\n")
+    messages.append(f"📊 <b>{symbol}</b>")
+    messages.append(f"💰 Spot: <b>₹{spot_price:,.2f}</b> | 📅 {expiry}\n")
     
     # Group by strike
     strikes = {}
@@ -375,70 +374,74 @@ def format_option_chain_message(symbol, spot_price, expiry, option_data, full_da
         if isinstance(data, dict):
             strikes[strike][opt['type']] = data
         else:
-            # Fallback if old format (just LTP)
             strikes[strike][opt['type']] = {'ltp': data}
     
-    # Header
-    messages.append("<b>CALL SIDE</b> | <b>STRIKE</b> | <b>PUT SIDE</b>")
-    messages.append("─" * 45)
+    # Check if we have OI data
+    has_oi_data = any(
+        strikes[s]['CE'].get('oi', 0) > 0 or strikes[s]['PE'].get('oi', 0) > 0 
+        for s in strikes
+    )
+    
+    # Header - compact format
+    if has_oi_data:
+        messages.append("<code>CALL    | STRIKE | PUT</code>")
+        messages.append("<code>LTP  OI | Price  | LTP  OI</code>")
+    else:
+        messages.append("<code>  CALL  | STRIKE |   PUT</code>")
+    messages.append("─" * 35)
     
     # Display sorted by strike
+    total_ce_oi = 0
+    total_pe_oi = 0
+    total_ce_vol = 0
+    total_pe_vol = 0
+    
     for strike in sorted(strikes.keys()):
         ce_data = strikes[strike].get('CE', {})
         pe_data = strikes[strike].get('PE', {})
         
-        # Format strike
-        strike_str = f"<b>{int(strike)}</b>"
-        
-        # CE side
         ce_ltp = ce_data.get('ltp', 0)
         ce_oi = ce_data.get('oi', 0)
         ce_vol = ce_data.get('volume', 0)
-        ce_oi_chg = ce_data.get('oiChange', 0)
         
-        if ce_ltp > 0:
-            ce_str = f"₹{ce_ltp:.1f}"
-            if ce_oi > 0:
-                ce_str += f"\n  OI: {ce_oi:,}"
-            if ce_oi_chg != 0:
-                ce_str += f" ({ce_oi_chg:+.0f}%)"
-            if ce_vol > 0:
-                ce_str += f"\n  Vol: {ce_vol:,}"
-        else:
-            ce_str = "-"
-        
-        # PE side
         pe_ltp = pe_data.get('ltp', 0)
         pe_oi = pe_data.get('oi', 0)
         pe_vol = pe_data.get('volume', 0)
-        pe_oi_chg = pe_data.get('oiChange', 0)
         
-        if pe_ltp > 0:
-            pe_str = f"₹{pe_ltp:.1f}"
-            if pe_oi > 0:
-                pe_str += f"\n  OI: {pe_oi:,}"
-            if pe_oi_chg != 0:
-                pe_str += f" ({pe_oi_chg:+.0f}%)"
-            if pe_vol > 0:
-                pe_str += f"\n  Vol: {pe_vol:,}"
+        total_ce_oi += ce_oi
+        total_pe_oi += pe_oi
+        total_ce_vol += ce_vol
+        total_pe_vol += pe_vol
+        
+        strike_str = f"{int(strike)}"
+        
+        if has_oi_data:
+            # Compact format with OI
+            ce_oi_k = f"{ce_oi//1000}K" if ce_oi >= 1000 else str(ce_oi)
+            pe_oi_k = f"{pe_oi//1000}K" if pe_oi >= 1000 else str(pe_oi)
+            
+            ce_str = f"{ce_ltp:>6.1f} {ce_oi_k:>4}" if ce_ltp > 0 else "    -     "
+            pe_str = f"{pe_ltp:>6.1f} {pe_oi_k:>4}" if pe_ltp > 0 else "    -     "
+            
+            messages.append(f"<code>{ce_str} | {strike_str:>6} | {pe_str}</code>")
         else:
-            pe_str = "-"
-        
-        messages.append(f"{ce_str} | {strike_str} | {pe_str}")
-        messages.append("")  # Empty line for readability
+            # Simple LTP format
+            ce_str = f"₹{ce_ltp:>6.1f}" if ce_ltp > 0 else "    -  "
+            pe_str = f"₹{pe_ltp:>6.1f}" if pe_ltp > 0 else "    -  "
+            
+            messages.append(f"<code>{ce_str} | {strike_str:>6} | {pe_str}</code>")
     
-    messages.append("─" * 45)
+    messages.append("─" * 35)
     
     # Summary
-    total_ce_oi = sum(strikes[s]['CE'].get('oi', 0) for s in strikes)
-    total_pe_oi = sum(strikes[s]['PE'].get('oi', 0) for s in strikes)
-    total_ce_vol = sum(strikes[s]['CE'].get('volume', 0) for s in strikes)
-    total_pe_vol = sum(strikes[s]['PE'].get('volume', 0) for s in strikes)
+    if has_oi_data and (total_ce_oi > 0 or total_pe_oi > 0):
+        messages.append(f"<b>OI:</b> CE {total_ce_oi:,} | PE {total_pe_oi:,}")
+        pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
+        messages.append(f"<b>PCR:</b> {pcr:.2f}")
     
-    messages.append(f"<b>📈 Total CE OI:</b> {total_ce_oi:,}")
-    messages.append(f"<b>📉 Total PE OI:</b> {total_pe_oi:,}")
-    messages.append(f"<b>PCR (OI):</b> {(total_pe_oi/total_ce_oi if total_ce_oi > 0 else 0):.2f}")
-    messages.append(f"<b>📊 CE Vol:</b> {total_ce_vol:,} | <b>PE Vol:</b> {total_pe_vol:,}")
+    if total_ce_vol > 0 or total_pe_vol > 0:
+        messages.append(f"<b>Vol:</b> CE {total_ce_vol:,} | PE {total_pe_vol:,}")
+    
     messages.append(f"\n🕐 {time.strftime('%H:%M:%S')}")
     
     return "\n".join(messages)
