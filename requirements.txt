@@ -1,9 +1,8 @@
-pyotp==2.8.0
-requests==2.31.0
-Flask==2.3.2
+Flask==3.0.0
 gunicorn==21.2.0
-smartapi-python
-logzero
-websocket-client
-beautifulsoup4
-lxml
+requests==2.31.0
+pyotp==2.9.0
+smartapi-python==1.3.4
+pandas==2.1.4
+matplotlib==3.8.2
+Pillow==10.1.0
