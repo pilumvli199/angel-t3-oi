@@ -6,6 +6,7 @@ from flask import Flask, jsonify
 import pyotp
 import requests
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 # ---- SmartAPI import ----
 SmartConnect = None
@@ -17,7 +18,7 @@ except Exception as e:
     logging.error(f"Failed to import SmartConnect: {e}")
     SmartConnect = None
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger('angel-option-chain-bot')
 
 # Load config from env
@@ -33,51 +34,54 @@ REQUIRED = [API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET, TELE_TOKEN, TELE_CHAT_ID]
 
 app = Flask(__name__)
 
-# Symbol configurations
+# Symbol configurations - CORRECTED EXPIRY TYPES
 SYMBOLS_CONFIG = {
     'NIFTY': {
         'spot_token': '99926000',
         'exchange': 'NSE',
         'strike_gap': 50,
-        'expiry_type': 'weekly',  # Weekly expiry - Thursday
-        'strikes_count': 21  # ATM ± 10
+        'expiry_type': 'weekly',  # Weekly - Thursday
+        'strikes_count': 21
     },
     'BANKNIFTY': {
         'spot_token': '99926009',
         'exchange': 'NSE',
         'strike_gap': 100,
-        'expiry_type': 'weekly',  # Weekly expiry - Wednesday
+        'expiry_type': 'monthly',  # CORRECTED - Monthly, last Wednesday
         'strikes_count': 21
     },
     'MIDCPNIFTY': {
         'spot_token': '99926037',
         'exchange': 'NSE',
         'strike_gap': 25,
-        'expiry_type': 'weekly',  # Weekly expiry - Monday
+        'expiry_type': 'monthly',  # CORRECTED - Monthly
         'strikes_count': 21
     },
     'FINNIFTY': {
         'spot_token': '99926074',
         'exchange': 'NSE',
         'strike_gap': 50,
-        'expiry_type': 'weekly',  # Weekly expiry - Tuesday
+        'expiry_type': 'monthly',  # CORRECTED - Monthly
         'strikes_count': 21
     },
     'SENSEX': {
         'spot_token': '99919000',
         'exchange': 'BSE',
         'strike_gap': 100,
-        'expiry_type': 'weekly',  # Weekly expiry - Friday
+        'expiry_type': 'weekly',  # Weekly - Friday (BSE)
         'strikes_count': 21
     },
     'HDFCBANK': {
         'spot_token': '1333',
         'exchange': 'NSE',
         'strike_gap': 20,
-        'expiry_type': 'monthly',  # Monthly expiry - last Thursday
+        'expiry_type': 'monthly',  # Monthly - last Thursday
         'strikes_count': 21
     }
 }
+
+# Store previous OI data for change calculation
+previous_oi = defaultdict(dict)
 
 def tele_send_http(chat_id: str, text: str):
     """Send message using Telegram Bot HTTP API via requests (synchronous)."""
@@ -112,10 +116,10 @@ def login_and_setup(api_key, client_id, password, totp_secret):
         raise RuntimeError(f"Login failed: {data}")
     authToken = data['data']['jwtToken']
     refreshToken = data['data']['refreshToken']
-    logger.info(f"✅ Login successful! Auth token: {authToken[:20]}...")
+    logger.info(f"✅ Login successful!")
     try:
         feedToken = smartApi.getfeedToken()
-        logger.info(f"Feed token: {feedToken}")
+        logger.info(f"Feed token obtained")
     except Exception as e:
         logger.warning(f"Feed token failed: {e}")
         feedToken = None
@@ -124,54 +128,6 @@ def login_and_setup(api_key, client_id, password, totp_secret):
     except Exception:
         pass
     return smartApi, authToken, refreshToken, feedToken
-
-def get_next_expiry(expiry_type, symbol_name=''):
-    """Get next expiry based on type and symbol"""
-    today = datetime.now()
-    
-    if expiry_type == 'weekly':
-        # Different weekly expiries for different indices
-        if 'NIFTY' in symbol_name and 'BANK' not in symbol_name and 'FIN' not in symbol_name and 'MIDCP' not in symbol_name:
-            # NIFTY - Thursday (weekday 3)
-            target_day = 3
-        elif 'BANKNIFTY' in symbol_name:
-            # BANKNIFTY - Wednesday (weekday 2)
-            target_day = 2
-        elif 'FINNIFTY' in symbol_name:
-            # FINNIFTY - Tuesday (weekday 1)
-            target_day = 1
-        elif 'MIDCPNIFTY' in symbol_name:
-            # MIDCPNIFTY - Monday (weekday 0)
-            target_day = 0
-        elif 'SENSEX' in symbol_name:
-            # SENSEX - Friday (weekday 4)
-            target_day = 4
-        else:
-            # Default to Thursday
-            target_day = 3
-        
-        days_ahead = target_day - today.weekday()
-        if days_ahead <= 0:  # If today is target day or later, get next week
-            days_ahead += 7
-        expiry = today + timedelta(days=days_ahead)
-        
-    else:  # monthly
-        # Get last Thursday of current month
-        if today.month == 12:
-            next_month = datetime(today.year + 1, 1, 1)
-        else:
-            next_month = datetime(today.year, today.month + 1, 1)
-        
-        last_day = next_month - timedelta(days=1)
-        
-        # Find last Thursday (weekday 3)
-        while last_day.weekday() != 3:
-            last_day = last_day - timedelta(days=1)
-        
-        expiry = last_day
-    
-    # Format: DDMMMYYYY (e.g., 30OCT2025)
-    return expiry.strftime('%d%b%Y').upper()
 
 def download_instruments(smartApi):
     """Download instrument master file from Angel One"""
@@ -190,10 +146,57 @@ def download_instruments(smartApi):
         logger.exception(f"❌ Failed to download instruments: {e}")
         return None
 
+def find_nearest_expiry(instruments, symbol):
+    """Find the nearest available expiry from instruments for a symbol"""
+    try:
+        # Get all unique expiries for this symbol
+        expiries = set()
+        for inst in instruments:
+            if inst.get('name') == symbol and inst.get('expiry'):
+                exp = inst.get('expiry')
+                if exp:
+                    expiries.add(exp)
+        
+        if not expiries:
+            logger.warning(f"No expiries found for {symbol}")
+            return None
+        
+        # Parse expiries and find nearest future one
+        today = datetime.now()
+        future_expiries = []
+        
+        for exp_str in expiries:
+            try:
+                # Try different formats
+                for fmt in ['%d%b%Y', '%d%b%y']:
+                    try:
+                        exp_date = datetime.strptime(exp_str, fmt)
+                        if exp_date >= today:
+                            future_expiries.append((exp_date, exp_str))
+                        break
+                    except:
+                        continue
+            except:
+                continue
+        
+        if not future_expiries:
+            logger.warning(f"No future expiries found for {symbol}")
+            return None
+        
+        # Return the nearest one
+        future_expiries.sort()
+        nearest_expiry = future_expiries[0][1]
+        logger.info(f"📅 {symbol} nearest expiry: {nearest_expiry}")
+        return nearest_expiry
+        
+    except Exception as e:
+        logger.exception(f"Error finding expiry for {symbol}: {e}")
+        return None
+
 def find_option_tokens(instruments, symbol, target_expiry, current_price, strike_gap, strikes_count):
     """Find option tokens for strikes around current price"""
-    if not instruments:
-        logger.error("No instruments available!")
+    if not instruments or not target_expiry:
+        logger.error(f"Missing instruments or expiry for {symbol}")
         return []
     
     logger.info(f"🔍 Finding {strikes_count} strikes for {symbol}, Expiry: {target_expiry}, Price: {current_price}")
@@ -207,10 +210,9 @@ def find_option_tokens(instruments, symbol, target_expiry, current_price, strike
     for i in range(-half_strikes, half_strikes + 1):
         strikes.append(atm + (i * strike_gap))
     
-    logger.info(f"🎯 ATM: {atm}, Strike gap: {strike_gap}, Range: {min(strikes)} to {max(strikes)}")
+    logger.info(f"🎯 ATM: {atm}, Range: {min(strikes)} to {max(strikes)}")
     
     option_tokens = []
-    matched_strikes = set()
     
     for instrument in instruments:
         inst_name = instrument.get('name', '')
@@ -220,13 +222,12 @@ def find_option_tokens(instruments, symbol, target_expiry, current_price, strike
         if inst_name == symbol and inst_expiry == target_expiry:
             strike_raw = instrument.get('strike', '0')
             try:
-                # Strike is in paise (as string), convert to rupees
+                # Strike is in paise, convert to rupees
                 strike = float(strike_raw) / 100
             except (ValueError, TypeError):
                 continue
                 
             if strike > 0 and strike in strikes:
-                matched_strikes.add(strike)
                 symbol_name = instrument.get('symbol', '')
                 option_type = 'CE' if 'CE' in symbol_name else 'PE'
                 token = instrument.get('token')
@@ -238,18 +239,16 @@ def find_option_tokens(instruments, symbol, target_expiry, current_price, strike
                     'expiry': inst_expiry
                 })
     
-    logger.info(f"✅ Found {len(option_tokens)} option contracts for {symbol}")
-    
+    logger.info(f"✅ Found {len(option_tokens)} options for {symbol}")
     return sorted(option_tokens, key=lambda x: (x['strike'], x['type']))
 
-def get_option_chain_data_full(smartApi, option_tokens):
-    """Fetch full option chain data including Greeks, OI, Volume"""
+def get_option_ltp_oi_volume(smartApi, option_tokens):
+    """Fetch LTP, OI, Volume for options using Market Data API"""
     try:
         if not option_tokens:
-            logger.warning("No option tokens provided")
             return {}
         
-        logger.info(f"📡 Fetching FULL data for {len(option_tokens)} options...")
+        logger.info(f"📡 Fetching market data for {len(option_tokens)} options...")
         
         headers = {
             'Authorization': f'Bearer {smartApi.access_token}',
@@ -263,62 +262,106 @@ def get_option_chain_data_full(smartApi, option_tokens):
             'X-PrivateKey': API_KEY
         }
         
+        # Split into batches of 50 tokens (API limit)
         all_tokens = [opt['token'] for opt in option_tokens]
+        result = {}
         
-        # Use FULL mode instead of LTP for complete data
-        payload = {
-            "mode": "FULL",
-            "exchangeTokens": {
-                "NFO": all_tokens
+        for i in range(0, len(all_tokens), 50):
+            batch = all_tokens[i:i+50]
+            
+            payload = {
+                "mode": "FULL",
+                "exchangeTokens": {
+                    "NFO": batch
+                }
             }
+            
+            response = requests.post(
+                'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
+                json=payload,
+                headers=headers,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status'):
+                    fetched = data.get('data', {}).get('fetched', [])
+                    
+                    for item in fetched:
+                        token = item.get('symbolToken', '')
+                        result[token] = {
+                            'ltp': float(item.get('ltp', 0)),
+                            'oi': int(item.get('opnInterest', 0)),
+                            'volume': int(item.get('tradeVolume', 0)),
+                        }
+            
+            time.sleep(0.2)  # Rate limiting
+        
+        logger.info(f"✅ Fetched data for {len(result)} options")
+        return result
+        
+    except Exception as e:
+        logger.exception(f"❌ Failed to fetch market data: {e}")
+        return {}
+
+def get_option_greeks(smartApi, symbol, expiry):
+    """Fetch Option Greeks using Option Greeks API"""
+    try:
+        logger.info(f"🔢 Fetching Greeks for {symbol} {expiry}...")
+        
+        headers = {
+            'Authorization': f'Bearer {smartApi.access_token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'X-UserType': 'USER',
+            'X-SourceID': 'WEB',
+            'X-ClientLocalIP': '127.0.0.1',
+            'X-ClientPublicIP': '127.0.0.1',
+            'X-MACAddress': '00:00:00:00:00:00',
+            'X-PrivateKey': API_KEY
+        }
+        
+        payload = {
+            "name": symbol,
+            "expirydate": expiry
         }
         
         response = requests.post(
-            'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
+            'https://apiconnect.angelbroking.com/rest/secure/angelbroking/marketData/v1/optionGreek',
             json=payload,
             headers=headers,
-            timeout=20
+            timeout=15
         )
-        
-        logger.info(f"API Response Status: {response.status_code}")
         
         if response.status_code == 200:
             data = response.json()
-            
             if data.get('status'):
-                result = {}
-                fetched = data.get('data', {}).get('fetched', [])
-                logger.info(f"✅ Fetched full data for {len(fetched)} instruments")
-                
-                for item in fetched:
-                    token = item.get('symbolToken', '')
+                greeks_data = {}
+                for item in data.get('data', []):
+                    strike = float(item.get('strikePrice', 0))
+                    opt_type = item.get('optionType', '')
                     
-                    # Extract all relevant fields
-                    result[token] = {
-                        'ltp': float(item.get('ltp', 0)),
-                        'oi': int(item.get('oi', 0)),
-                        'volume': int(item.get('volume', 0)),
-                        'change_oi': int(item.get('oiDayHigh', 0)) - int(item.get('oiDayLow', 0)),  # Approximate
-                        'iv': float(item.get('iv', 0)) if item.get('iv') else 0,
-                        'delta': float(item.get('delta', 0)) if item.get('delta') else 0,
-                        'theta': float(item.get('theta', 0)) if item.get('theta') else 0,
-                        'gamma': float(item.get('gamma', 0)) if item.get('gamma') else 0,
-                        'vega': float(item.get('vega', 0)) if item.get('vega') else 0,
-                        'change': float(item.get('change', 0))
+                    key = f"{strike}_{opt_type}"
+                    greeks_data[key] = {
+                        'delta': float(item.get('delta', 0)),
+                        'gamma': float(item.get('gamma', 0)),
+                        'theta': float(item.get('theta', 0)),
+                        'vega': float(item.get('vega', 0)),
+                        'iv': float(item.get('impliedVolatility', 0))
                     }
                 
-                if result:
-                    logger.info(f"Sample data: {list(result.items())[0]}")
-                return result
+                logger.info(f"✅ Got Greeks for {len(greeks_data)} options")
+                return greeks_data
             else:
-                logger.error(f"API returned status=false: {data}")
+                logger.warning(f"Greeks API error: {data.get('message')}")
         else:
-            logger.error(f"API error: {response.text}")
+            logger.warning(f"Greeks API HTTP {response.status_code}")
         
         return {}
         
     except Exception as e:
-        logger.exception(f"❌ Failed to fetch option chain data: {e}")
+        logger.exception(f"❌ Failed to fetch Greeks: {e}")
         return {}
 
 def get_spot_prices(smartApi):
@@ -364,8 +407,6 @@ def get_spot_prices(smartApi):
             timeout=10
         )
         
-        logger.info(f"Spot API Status: {response.status_code}")
-        
         if response.status_code == 200:
             data = response.json()
             if data.get('status'):
@@ -384,10 +425,6 @@ def get_spot_prices(smartApi):
                             break
                 
                 return result
-            else:
-                logger.error(f"Spot API status=false: {data}")
-        else:
-            logger.error(f"Spot API error: {response.text}")
         
         return {}
         
@@ -395,8 +432,8 @@ def get_spot_prices(smartApi):
         logger.exception(f"❌ Failed to fetch spot prices: {e}")
         return {}
 
-def format_option_chain_message(symbol, spot_price, expiry, option_data, full_data):
-    """Format option chain data for Telegram - COMPACT version for 21 strikes"""
+def format_option_chain_message(symbol, spot_price, expiry, option_data, market_data, greeks_data):
+    """Format compact option chain message with all data"""
     messages = []
     messages.append(f"📊 <b>{symbol}</b>")
     messages.append(f"💰 ₹{spot_price:,.1f} | 📅 {expiry}\n")
@@ -409,52 +446,87 @@ def format_option_chain_message(symbol, spot_price, expiry, option_data, full_da
             strikes[strike] = {'CE': {}, 'PE': {}}
         
         token = opt['token']
-        data = full_data.get(token, {})
-        strikes[strike][opt['type']] = data
+        mdata = market_data.get(token, {})
+        
+        # Get Greeks
+        greek_key = f"{strike}_{opt['type']}"
+        gdata = greeks_data.get(greek_key, {})
+        
+        # Calculate OI change
+        prev_oi = previous_oi.get(symbol, {}).get(token, 0)
+        current_oi = mdata.get('oi', 0)
+        oi_change = current_oi - prev_oi
+        
+        # Store current OI for next iteration
+        if symbol not in previous_oi:
+            previous_oi[symbol] = {}
+        previous_oi[symbol][token] = current_oi
+        
+        strikes[strike][opt['type']] = {
+            **mdata,
+            **gdata,
+            'oi_change': oi_change
+        }
     
-    # Ultra compact header for 21 strikes
-    messages.append("<code>CALL        |STRIKE| PUT</code>")
-    messages.append("<code>LTP OI  Δ   |      |LTP OI  Δ</code>")
+    # Compact header
+    messages.append("<code>CE Data      |Strike| PE Data</code>")
+    messages.append("<code>LTP OI  ΔOI |      |LTP OI  ΔOI</code>")
     messages.append("─" * 38)
     
     total_ce_oi = 0
     total_pe_oi = 0
+    total_ce_vol = 0
+    total_pe_vol = 0
     
     for strike in sorted(strikes.keys()):
-        ce_data = strikes[strike].get('CE', {})
-        pe_data = strikes[strike].get('PE', {})
+        ce = strikes[strike].get('CE', {})
+        pe = strikes[strike].get('PE', {})
         
-        ce_ltp = ce_data.get('ltp', 0)
-        ce_oi = ce_data.get('oi', 0)
-        ce_chg_oi = ce_data.get('change_oi', 0)
+        ce_ltp = ce.get('ltp', 0)
+        ce_oi = ce.get('oi', 0)
+        ce_chg = ce.get('oi_change', 0)
+        ce_vol = ce.get('volume', 0)
         
-        pe_ltp = pe_data.get('ltp', 0)
-        pe_oi = pe_data.get('oi', 0)
-        pe_chg_oi = pe_data.get('change_oi', 0)
+        pe_ltp = pe.get('ltp', 0)
+        pe_oi = pe.get('oi', 0)
+        pe_chg = pe.get('oi_change', 0)
+        pe_vol = pe.get('volume', 0)
         
         total_ce_oi += ce_oi
         total_pe_oi += pe_oi
+        total_ce_vol += ce_vol
+        total_pe_vol += pe_vol
         
-        # Ultra compact formatting
-        ce_oi_str = f"{ce_oi//1000}k" if ce_oi >= 1000 else f"{ce_oi}"
-        pe_oi_str = f"{pe_oi//1000}k" if pe_oi >= 1000 else f"{pe_oi}"
+        # Format compact
+        def fmt_num(n):
+            if n >= 100000:
+                return f"{n//1000}k"
+            elif n >= 10000:
+                return f"{n//1000}k"
+            elif n >= 1000:
+                return f"{n//1000}k"
+            return str(int(n))
         
-        ce_chg_str = f"+{ce_chg_oi//1000}k" if ce_chg_oi > 1000 else (f"{ce_chg_oi//1000}k" if ce_chg_oi < -1000 else "")
-        pe_chg_str = f"+{pe_chg_oi//1000}k" if pe_chg_oi > 1000 else (f"{pe_chg_oi//1000}k" if pe_chg_oi < -1000 else "")
+        ce_oi_str = fmt_num(ce_oi) if ce_oi > 0 else "-"
+        pe_oi_str = fmt_num(pe_oi) if pe_oi > 0 else "-"
         
-        ce_str = f"{ce_ltp:>3.0f} {ce_oi_str:>3s} {ce_chg_str:>3s}" if ce_ltp > 0 else "            "
-        pe_str = f"{pe_ltp:>3.0f} {pe_oi_str:>3s} {pe_chg_str:>3s}" if pe_ltp > 0 else "            "
+        ce_chg_str = f"+{fmt_num(ce_chg)}" if ce_chg > 100 else (f"-{fmt_num(abs(ce_chg))}" if ce_chg < -100 else "")
+        pe_chg_str = f"+{fmt_num(pe_chg)}" if pe_chg > 100 else (f"-{fmt_num(abs(pe_chg))}" if pe_chg < -100 else "")
         
-        strike_str = f"{int(strike)}"
+        ce_str = f"{ce_ltp:>3.0f} {ce_oi_str:>3} {ce_chg_str:>4}" if ce_ltp > 0 else "            "
+        pe_str = f"{pe_ltp:>3.0f} {pe_oi_str:>3} {pe_chg_str:>4}" if pe_ltp > 0 else "            "
         
-        messages.append(f"<code>{ce_str}|{strike_str:>6}|{pe_str}</code>")
+        messages.append(f"<code>{ce_str}|{int(strike):>6}|{pe_str}</code>")
     
     messages.append("─" * 38)
     
     # Summary
     if total_ce_oi > 0 or total_pe_oi > 0:
         pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
-        messages.append(f"<b>PCR:</b> {pcr:.2f} | CE: {total_ce_oi//1000}k PE: {total_pe_oi//1000}k")
+        messages.append(f"<b>PCR:</b> {pcr:.2f} | CE OI: {total_ce_oi//1000}k PE OI: {total_pe_oi//1000}k")
+    
+    if total_ce_vol > 0 or total_pe_vol > 0:
+        messages.append(f"<b>Vol:</b> CE {total_ce_vol:,} PE {total_pe_vol:,}")
     
     messages.append(f"🕐 {time.strftime('%H:%M:%S')}")
     
@@ -474,10 +546,9 @@ def bot_loop():
         return
 
     symbols_list = ', '.join(SYMBOLS_CONFIG.keys())
-    tele_send_http(TELE_CHAT_ID, f"✅ Enhanced Option Chain Bot Started!\n📊 Tracking: {symbols_list}\n⏱ Update: {POLL_INTERVAL}s")
+    tele_send_http(TELE_CHAT_ID, f"✅ Enhanced Option Chain Bot Started!\n📊 Tracking: {symbols_list}\n⏱ Update: {POLL_INTERVAL}s\n\n⏳ Downloading instruments...")
     
-    # Download instruments once
-    logger.info("📥 Downloading instruments...")
+    # Download instruments
     instruments = download_instruments(smartApi)
     if not instruments:
         error_msg = "❌ Failed to download instruments. Bot cannot continue."
@@ -485,21 +556,17 @@ def bot_loop():
         tele_send_http(TELE_CHAT_ID, error_msg)
         return
     
-    # Calculate expiries for all symbols
+    # Find nearest expiries for all symbols
     expiries = {}
-    for symbol, config in SYMBOLS_CONFIG.items():
-        expiry = get_next_expiry(config['expiry_type'], symbol)
-        
-        # Verify expiry exists in instruments
-        available = sorted([i.get('expiry') for i in instruments 
-                          if i.get('name') == symbol and i.get('expiry')])
-        
-        if expiry not in available and available:
-            expiry = available[0]
-            logger.info(f"📅 Using nearest {symbol} expiry: {expiry}")
-        
-        expiries[symbol] = expiry
-        logger.info(f"📅 {symbol}: {expiry}")
+    for symbol in SYMBOLS_CONFIG.keys():
+        expiry = find_nearest_expiry(instruments, symbol)
+        if expiry:
+            expiries[symbol] = expiry
+        else:
+            logger.error(f"❌ Could not find expiry for {symbol}")
+    
+    expiry_msg = "\n".join([f"📅 {sym}: {exp}" for sym, exp in expiries.items()])
+    tele_send_http(TELE_CHAT_ID, f"📅 <b>Expiries Found:</b>\n{expiry_msg}")
     
     iteration = 0
     while True:
@@ -509,13 +576,17 @@ def bot_loop():
             logger.info(f"🔄 Iteration #{iteration} - {time.strftime('%H:%M:%S')}")
             logger.info(f"{'='*50}")
             
-            # Get spot prices for all symbols
+            # Get spot prices
             spot_prices = get_spot_prices(smartApi)
             
             # Process each symbol
             for symbol, config in SYMBOLS_CONFIG.items():
+                if symbol not in expiries:
+                    logger.warning(f"⚠️ No expiry for {symbol}, skipping")
+                    continue
+                
                 if symbol not in spot_prices:
-                    logger.warning(f"⚠️ No spot price for {symbol}")
+                    logger.warning(f"⚠️ No spot price for {symbol}, skipping")
                     continue
                 
                 logger.info(f"\n--- Processing {symbol} ---")
@@ -532,28 +603,36 @@ def bot_loop():
                     config['strikes_count']
                 )
                 
-                if option_tokens:
-                    # Fetch full data
-                    full_data = get_option_chain_data_full(smartApi, option_tokens)
-                    if full_data:
-                        msg = format_option_chain_message(symbol, spot_price, expiry, option_tokens, full_data)
-                        tele_send_http(TELE_CHAT_ID, msg)
-                        logger.info(f"✅ {symbol} data sent to Telegram")
-                        time.sleep(2)  # Delay between messages
-                    else:
-                        logger.warning(f"⚠️ No data received for {symbol} options")
+                if not option_tokens:
+                    logger.warning(f"⚠️ No options found for {symbol}")
+                    continue
+                
+                # Fetch market data (LTP, OI, Volume)
+                market_data = get_option_ltp_oi_volume(smartApi, option_tokens)
+                
+                # Fetch Greeks
+                greeks_data = get_option_greeks(smartApi, symbol, expiry)
+                
+                if market_data:
+                    msg = format_option_chain_message(
+                        symbol, spot_price, expiry, 
+                        option_tokens, market_data, greeks_data
+                    )
+                    tele_send_http(TELE_CHAT_ID, msg)
+                    logger.info(f"✅ {symbol} data sent")
+                    time.sleep(2)
                 else:
-                    logger.warning(f"⚠️ No option contracts found for {symbol}")
+                    logger.warning(f"⚠️ No market data for {symbol}")
             
             logger.info(f"✅ Iteration #{iteration} complete. Sleeping {POLL_INTERVAL}s...")
             
         except Exception as e:
-            logger.exception(f"❌ Error in bot loop iteration #{iteration}: {e}")
+            logger.exception(f"❌ Error in iteration #{iteration}: {e}")
             tele_send_http(TELE_CHAT_ID, f"⚠️ Error #{iteration}: {str(e)[:100]}")
         
         time.sleep(POLL_INTERVAL)
 
-# Start bot in a background thread
+# Start bot in background thread
 thread = threading.Thread(target=bot_loop, daemon=True)
 thread.start()
 
@@ -564,7 +643,7 @@ def index():
         'poll_interval': POLL_INTERVAL,
         'symbols': list(SYMBOLS_CONFIG.keys()),
         'smartapi_sdk_available': SmartConnect is not None,
-        'service': 'Angel One Enhanced Option Chain Bot',
+        'service': 'Angel One Enhanced Option Chain Bot v2',
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
     }
     return jsonify(status)
