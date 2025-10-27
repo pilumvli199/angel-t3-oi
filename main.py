@@ -169,7 +169,9 @@ def find_nearest_expiry(instruments, symbol, exch_seg, name_in_inst):
         return None
 
 def find_option_tokens(instruments, symbol, target_expiry, current_price, strike_gap, strikes_count, exch_seg, name_in_inst):
+    """Find option tokens - with debug logging"""
     if not instruments or not target_expiry:
+        logger.warning(f"{symbol}: No instruments or expiry")
         return []
     
     atm = round(current_price / strike_gap) * strike_gap
@@ -177,6 +179,30 @@ def find_option_tokens(instruments, symbol, target_expiry, current_price, strike
     half = strikes_count // 2
     for i in range(-half, half + 1):
         strikes.append(atm + (i * strike_gap))
+    
+    logger.info(f"{symbol}: Looking for strikes {min(strikes)} to {max(strikes)}")
+    logger.info(f"{symbol}: Searching name='{name_in_inst}', expiry='{target_expiry}', exch_seg='{exch_seg}'")
+    
+    # Debug: Check what's available
+    available_names = set()
+    for inst in instruments:
+        if inst.get('exch_seg') == exch_seg and inst.get('expiry') == target_expiry:
+            available_names.add(inst.get('name'))
+    
+    if available_names:
+        logger.info(f"{symbol}: Available names with expiry {target_expiry}: {available_names}")
+    else:
+        logger.warning(f"{symbol}: No instruments found with expiry {target_expiry} in {exch_seg}")
+        # Try without expiry check
+        available_names = set()
+        for inst in instruments:
+            if inst.get('exch_seg') == exch_seg and name_in_inst in inst.get('name', ''):
+                available_names.add(inst.get('name'))
+                if not target_expiry:
+                    if inst.get('expiry'):
+                        logger.info(f"   Found expiry: {inst.get('expiry')}")
+        if available_names:
+            logger.info(f"{symbol}: Names containing '{name_in_inst}': {list(available_names)[:5]}")
     
     option_tokens = []
     for inst in instruments:
@@ -198,6 +224,7 @@ def find_option_tokens(instruments, symbol, target_expiry, current_price, strike
                     'expiry': target_expiry
                 })
     
+    logger.info(f"✅ {symbol}: Found {len(option_tokens)} option tokens")
     return sorted(option_tokens, key=lambda x: (x['strike'], x['type']))
 
 def get_option_data(smartApi, option_tokens, exch_seg):
@@ -376,12 +403,16 @@ def get_historical_candles(smartApi, symbol, token, exchange):
         return None
 
 def create_candlestick_chart(df, symbol, spot_price):
+    """Create candlestick chart with TODAY'S date highlighted"""
     try:
-        fig, ax = plt.subplots(figsize=(16, 9), facecolor='#1e1e1e')
-        ax.set_facecolor('#1e1e1e')
+        fig, ax = plt.subplots(figsize=(16, 9), facecolor='#0a0a0a')
+        ax.set_facecolor('#0a0a0a')
         
-        # Reset index for plotting
+        # Reset index
         df_plot = df.reset_index(drop=True)
+        
+        # Get today's date
+        today = datetime.now().date()
         
         for idx in range(len(df_plot)):
             row = df_plot.iloc[idx]
@@ -389,11 +420,18 @@ def create_candlestick_chart(df, symbol, spot_price):
             high_price = row['high']
             low_price = row['low']
             close_price = row['close']
+            candle_date = row['timestamp'].date()
             
-            color = '#26a69a' if close_price >= open_price else '#ef5350'
+            # Brighter colors for today's candles
+            if candle_date == today:
+                color = '#00ff00' if close_price >= open_price else '#ff0000'
+                alpha = 1.0
+            else:
+                color = '#26a69a' if close_price >= open_price else '#ef5350'
+                alpha = 0.7
             
             # High-low line
-            ax.plot([idx, idx], [low_price, high_price], color=color, linewidth=1.5)
+            ax.plot([idx, idx], [low_price, high_price], color=color, linewidth=1.5, alpha=alpha)
             
             # Candle body
             body_height = abs(close_price - open_price)
@@ -401,46 +439,66 @@ def create_candlestick_chart(df, symbol, spot_price):
             
             if body_height > 0:
                 rect = Rectangle((idx - 0.4, body_bottom), 0.8, body_height, 
-                               facecolor=color, edgecolor=color, linewidth=0)
+                               facecolor=color, edgecolor=color, linewidth=0, alpha=alpha)
                 ax.add_patch(rect)
             else:
-                # Doji
-                ax.plot([idx - 0.4, idx + 0.4], [close_price, close_price], color=color, linewidth=2)
+                ax.plot([idx - 0.4, idx + 0.4], [close_price, close_price], 
+                       color=color, linewidth=2, alpha=alpha)
         
-        # Styling
+        # Title with LIVE indicator
+        last_candle = df_plot.iloc[-1]
+        last_time = last_candle['timestamp']
+        last_close = last_candle['close']
+        
+        time_diff = (datetime.now() - last_time).total_seconds() / 60
+        live_indicator = "🟢 LIVE" if time_diff < 30 else "🟡 DELAYED" if time_diff < 120 else "🔴 OLD"
+        
         ax.set_xlabel('Time', fontsize=12, fontweight='bold', color='white')
         ax.set_ylabel('Price', fontsize=12, fontweight='bold', color='white')
         
-        # Title with last candle time
-        last_time = df_plot.iloc[-1]['timestamp'].strftime('%d-%b %H:%M')
-        ax.set_title(f'{symbol} Live Chart | Spot: ₹{spot_price:,.2f} | Last: {last_time}', 
-                    fontsize=16, fontweight='bold', pad=20, color='white')
+        title = f'{symbol} {live_indicator} | Spot: ₹{spot_price:,.2f} | Last: {last_time.strftime("%d-%b %H:%M")} @ ₹{last_close:,.2f}'
+        ax.set_title(title, fontsize=14, fontweight='bold', pad=20, color='white')
         
         # Grid
-        ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5, color='gray')
+        ax.grid(True, alpha=0.15, linestyle='--', linewidth=0.5, color='gray')
         ax.set_axisbelow(True)
         
-        # X-axis - show every 10th candle
-        step = max(1, len(df_plot) // 10)
-        xticks = list(range(0, len(df_plot), step))
-        if xticks[-1] != len(df_plot) - 1:
-            xticks.append(len(df_plot) - 1)
+        # X-axis - show date changes prominently
+        xticks = []
+        xticklabels = []
+        last_date = None
         
-        xticklabels = [df_plot.iloc[i]['timestamp'].strftime('%d-%b\n%H:%M') for i in xticks]
+        for i in range(0, len(df_plot)):
+            current_date = df_plot.iloc[i]['timestamp'].date()
+            
+            # Mark date changes
+            if current_date != last_date:
+                xticks.append(i)
+                xticklabels.append(df_plot.iloc[i]['timestamp'].strftime('%d-%b\n%H:%M'))
+                last_date = current_date
+            elif i % 20 == 0:  # Also show every 20 candles
+                xticks.append(i)
+                xticklabels.append(df_plot.iloc[i]['timestamp'].strftime('%H:%M'))
+        
+        # Always show last candle
+        if len(df_plot) - 1 not in xticks:
+            xticks.append(len(df_plot) - 1)
+            xticklabels.append(df_plot.iloc[-1]['timestamp'].strftime('%d-%b\n%H:%M'))
+        
         ax.set_xticks(xticks)
         ax.set_xticklabels(xticklabels, rotation=0, ha='center', color='white', fontsize=9)
         
-        # Y-axis color
+        # Y-axis
         ax.tick_params(axis='y', colors='white')
         
-        # Spine colors
+        # Spines
         for spine in ax.spines.values():
-            spine.set_edgecolor('#444444')
+            spine.set_edgecolor('#333333')
         
         plt.tight_layout()
         
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100, facecolor='#1e1e1e')
+        plt.savefig(buf, format='png', dpi=120, facecolor='#0a0a0a')
         buf.seek(0)
         plt.close(fig)
         
