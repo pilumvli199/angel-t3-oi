@@ -399,6 +399,90 @@ def get_index_prices(smartApi):
         logger.exception(f"Failed to fetch index prices: {e}")
         return {}
 
+def get_historical_candles(smartApi, symbol, token, exchange):
+    """Fetch last 500 candles in 15-min timeframe"""
+    try:
+        logger.info(f"📊 Fetching candles for {symbol}...")
+        
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=30)
+        
+        params = {
+            "exchange": exchange,
+            "symboltoken": token,
+            "interval": "FIFTEEN_MINUTE",
+            "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
+            "todate": to_date.strftime("%Y-%m-%d %H:%M")
+        }
+        
+        response = smartApi.getCandleData(params)
+        
+        if response and response.get('status'):
+            candles = response.get('data', [])
+            logger.info(f"✅ Got {len(candles)} candles for {symbol}")
+            
+            df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            if len(df) > 500:
+                df = df.tail(500)
+            
+            return df
+        else:
+            logger.warning(f"No candle data for {symbol}: {response}")
+            return None
+    except Exception as e:
+        logger.exception(f"Failed to fetch candles for {symbol}: {e}")
+        return None
+
+def create_candlestick_chart(df, symbol, spot_price):
+    """Create candlestick chart"""
+    try:
+        fig, ax = plt.subplots(figsize=(16, 9), facecolor='white')
+        ax.set_facecolor('white')
+        
+        for idx, row in df.iterrows():
+            open_price = row['open']
+            high_price = row['high']
+            low_price = row['low']
+            close_price = row['close']
+            
+            color = '#26a69a' if close_price >= open_price else '#ef5350'
+            
+            ax.plot([idx, idx], [low_price, high_price], color=color, linewidth=1)
+            
+            body_height = abs(close_price - open_price)
+            body_bottom = min(open_price, close_price)
+            rect = Rectangle((idx - 0.4, body_bottom), 0.8, body_height, 
+                           facecolor=color, edgecolor=color, linewidth=0)
+            ax.add_patch(rect)
+        
+        ax.set_xlabel('Time', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Price', fontsize=12, fontweight='bold')
+        ax.set_title(f'{symbol} - 15 Min Chart | Spot: ₹{spot_price:,.2f}', 
+                    fontsize=16, fontweight='bold', pad=20)
+        
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        ax.set_axisbelow(True)
+        
+        step = max(1, len(df) // 10)
+        xticks = range(0, len(df), step)
+        xticklabels = [df.iloc[i]['timestamp'].strftime('%d-%b %H:%M') for i in xticks]
+        ax.set_xticks(xticks)
+        ax.set_xticklabels(xticklabels, rotation=45, ha='right')
+        
+        plt.tight_layout()
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100, facecolor='white')
+        buf.seek(0)
+        plt.close(fig)
+        
+        return buf.getvalue()
+    except Exception as e:
+        logger.exception(f"Failed to create chart: {e}")
+        return None
+
 def format_volume(vol):
     """Format volume in readable format"""
     if vol >= 10000000:
@@ -571,11 +655,18 @@ def bot_loop():
             
             # 3. Option chains for each index
             for symbol, config in INDICES_CONFIG.items():
-                if symbol not in expiries or symbol not in index_prices:
+                if symbol not in expiries:
+                    logger.warning(f"No expiry for {symbol}")
+                    continue
+                    
+                if symbol not in index_prices:
+                    logger.warning(f"No spot price for {symbol}")
                     continue
                 
                 spot_price = index_prices[symbol]
                 expiry = expiries[symbol]
+                
+                logger.info(f"Processing {symbol} option chain...")
                 
                 option_tokens = find_option_tokens(
                     instruments, symbol, expiry, spot_price,
@@ -583,14 +674,31 @@ def bot_loop():
                     config['exch_seg'], config['name_in_instruments']
                 )
                 
-                if option_tokens:
-                    market_data = get_option_data(smartApi, option_tokens, config['exch_seg'])
-                    if market_data:
-                        msg = format_option_chain_detailed(
-                            symbol, spot_price, expiry, option_tokens, 
-                            market_data, config['lot_size'], config['strike_gap']
-                        )
-                        tele_send_http(TELE_CHAT_ID, msg)
+                if not option_tokens:
+                    logger.warning(f"No option tokens for {symbol}")
+                    continue
+                
+                market_data = get_option_data(smartApi, option_tokens, config['exch_seg'])
+                
+                if not market_data:
+                    logger.warning(f"No market data for {symbol}")
+                    continue
+                
+                msg = format_option_chain_detailed(
+                    symbol, spot_price, expiry, option_tokens, 
+                    market_data, config['lot_size'], config['strike_gap']
+                )
+                tele_send_http(TELE_CHAT_ID, msg)
+                logger.info(f"✅ {symbol} option chain sent")
+                time.sleep(3)
+                
+                # Send candlestick chart
+                candle_df = get_historical_candles(smartApi, symbol, config['spot_token'], config['exchange'])
+                if candle_df is not None and len(candle_df) > 0:
+                    chart_bytes = create_candlestick_chart(candle_df, symbol, spot_price)
+                    if chart_bytes:
+                        tele_send_photo(TELE_CHAT_ID, chart_bytes, f"📊 {symbol} 15-Min Chart")
+                        logger.info(f"✅ {symbol} chart sent")
                         time.sleep(2)
             
             logger.info(f"✅ Iteration #{iteration} done. Sleep {POLL_INTERVAL}s...")
