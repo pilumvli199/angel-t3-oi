@@ -48,7 +48,7 @@ SYMBOLS_CONFIG = {
         'strikes_count': 25,
         'lot_size': 25,
         'name_in_instruments': 'NIFTY',
-        'candle_interval': 'FIVE_MINUTE'  # Options: ONE_MINUTE, FIVE_MINUTE, FIFTEEN_MINUTE, ONE_HOUR, ONE_DAY
+        'candle_interval': 'FIVE_MINUTE'
     },
     'BANKNIFTY': {
         'spot_token': '99926009',
@@ -88,46 +88,6 @@ SYMBOLS_CONFIG = {
         'strikes_count': 25,
         'lot_size': 10,
         'name_in_instruments': 'SENSEX',
-        'candle_interval': 'FIVE_MINUTE'
-    },
-    'RELIANCE': {
-        'spot_token': '2885',
-        'exchange': 'NSE',
-        'exch_seg': 'NFO',
-        'strike_gap': 20,
-        'strikes_count': 21,
-        'lot_size': 250,
-        'name_in_instruments': 'RELIANCE',
-        'candle_interval': 'FIVE_MINUTE'
-    },
-    'HDFCBANK': {
-        'spot_token': '1333',
-        'exchange': 'NSE',
-        'exch_seg': 'NFO',
-        'strike_gap': 20,
-        'strikes_count': 21,
-        'lot_size': 550,
-        'name_in_instruments': 'HDFCBANK',
-        'candle_interval': 'FIVE_MINUTE'
-    },
-    'TCS': {
-        'spot_token': '11536',
-        'exchange': 'NSE',
-        'exch_seg': 'NFO',
-        'strike_gap': 50,
-        'strikes_count': 21,
-        'lot_size': 300,
-        'name_in_instruments': 'TCS',
-        'candle_interval': 'FIVE_MINUTE'
-    },
-    'INFY': {
-        'spot_token': '1594',
-        'exchange': 'NSE',
-        'exch_seg': 'NFO',
-        'strike_gap': 25,
-        'strikes_count': 21,
-        'lot_size': 300,
-        'name_in_instruments': 'INFY',
         'candle_interval': 'FIVE_MINUTE'
     },
 }
@@ -306,15 +266,10 @@ def get_spot_price(smartApi, token, exchange):
         return 0
 
 def get_candlestick_data(smartApi, token, exchange, interval='FIVE_MINUTE', candles=200):
-    """
-    Fetch historical candlestick data from Angel One
-    Intervals: ONE_MINUTE, FIVE_MINUTE, FIFTEEN_MINUTE, ONE_HOUR, ONE_DAY
-    """
+    """Fetch historical candlestick data from Angel One"""
     try:
-        # Calculate from and to dates
         to_date = datetime.now()
         
-        # Calculate days needed based on interval
         interval_minutes = {
             'ONE_MINUTE': 1,
             'FIVE_MINUTE': 5,
@@ -324,7 +279,7 @@ def get_candlestick_data(smartApi, token, exchange, interval='FIVE_MINUTE', cand
         }
         
         minutes_needed = candles * interval_minutes.get(interval, 5)
-        days_needed = (minutes_needed // (6.5 * 60)) + 5  # Market hours + buffer
+        days_needed = (minutes_needed // (6.5 * 60)) + 5
         from_date = to_date - timedelta(days=days_needed)
         
         params = {
@@ -335,61 +290,50 @@ def get_candlestick_data(smartApi, token, exchange, interval='FIVE_MINUTE', cand
             "todate": to_date.strftime("%Y-%m-%d %H:%M")
         }
         
-        logger.info(f"Fetching candles: {params}")
-        
+        logger.info(f"Fetching candles: {interval}")
         candle_data = smartApi.getCandleData(params)
         
         if candle_data and candle_data.get('status') and candle_data.get('data'):
             data = candle_data['data']
-            
-            # Convert to DataFrame
             df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df = df.sort_values('timestamp')
-            
-            # Get last N candles
-            df = df.tail(candles)
-            
+            df = df.sort_values('timestamp').tail(candles)
             logger.info(f"✅ Got {len(df)} candles")
             return df
         
-        logger.warning(f"No candle data: {candle_data}")
         return None
-        
     except Exception as e:
         logger.exception(f"Candlestick fetch failed: {e}")
         return None
 
 def create_candlestick_chart(symbol, df, spot_price):
-    """Create beautiful candlestick chart PNG"""
+    """Create beautiful candlestick chart using pure matplotlib"""
     try:
         if df is None or len(df) == 0:
             return None
         
-        # Prepare data
         df = df.copy()
         df['date_num'] = mdates.date2num(df['timestamp'])
-        ohlc = df[['date_num', 'open', 'high', 'low', 'close']].values
         
-        # Create figure
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), 
                                         gridspec_kw={'height_ratios': [3, 1]},
                                         facecolor='#0a0a0a')
         
-        # Candlestick chart
         ax1.set_facecolor('#0a0a0a')
         
-        # Plot candles
+        # Draw candlesticks
         for idx, row in df.iterrows():
             color = '#26a69a' if row['close'] >= row['open'] else '#ef5350'
             
-            # Wick
+            # Wick (High-Low line)
             ax1.plot([row['date_num'], row['date_num']], 
                     [row['low'], row['high']], 
                     color=color, linewidth=1, alpha=0.8)
             
-            # Body
+            # Body (Open-Close rectangle)
             height = abs(row['close'] - row['open'])
+            if height == 0:
+                height = 0.01
             bottom = min(row['open'], row['close'])
             
             rect = Rectangle((row['date_num'] - 0.0002, bottom), 
@@ -412,15 +356,13 @@ def create_candlestick_chart(symbol, df, spot_price):
             ax1.plot(df['date_num'], df['sma50'], color='#ff9800', 
                     linewidth=1.5, alpha=0.7, label='SMA 50')
         
-        # Formatting
+        # Format main chart
         ax1.xaxis.set_major_formatter(mdates.DateFormatter('%d-%b %H:%M'))
         ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
         plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right', color='white')
         ax1.tick_params(colors='white')
-        ax1.spines['bottom'].set_color('#333333')
-        ax1.spines['top'].set_color('#333333')
-        ax1.spines['right'].set_color('#333333')
-        ax1.spines['left'].set_color('#333333')
+        for spine in ax1.spines.values():
+            spine.set_color('#333333')
         
         ax1.set_title(f'{symbol} - Last 200 Candles', 
                      color='#00ff00', fontsize=16, fontweight='bold', pad=20)
@@ -439,10 +381,8 @@ def create_candlestick_chart(symbol, df, spot_price):
         ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
         plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right', color='white')
         ax2.tick_params(colors='white')
-        ax2.spines['bottom'].set_color('#333333')
-        ax2.spines['top'].set_color('#333333')
-        ax2.spines['right'].set_color('#333333')
-        ax2.spines['left'].set_color('#333333')
+        for spine in ax2.spines.values():
+            spine.set_color('#333333')
         
         ax2.set_ylabel('Volume', color='white', fontsize=10)
         ax2.grid(True, alpha=0.15, color='#333333')
@@ -461,7 +401,6 @@ def create_candlestick_chart(symbol, df, spot_price):
         
         plt.tight_layout()
         
-        # Save to bytes
         buf = io.BytesIO()
         plt.savefig(buf, format='PNG', facecolor='#0a0a0a', dpi=100)
         buf.seek(0)
@@ -485,7 +424,6 @@ def format_volume(vol):
 def create_option_chain_image(symbol, spot_price, expiry, option_data, market_data, lot_size, strike_gap):
     """Create beautiful PNG image of option chain"""
     try:
-        # Prepare data
         strikes = {}
         for opt in option_data:
             strike = opt['strike']
@@ -505,11 +443,9 @@ def create_option_chain_image(symbol, spot_price, expiry, option_data, market_da
             
             strikes[strike][opt['type']] = {**mdata, 'oi_change': oi_change}
         
-        # Calculate totals
         total_ce_oi = 0
         total_pe_oi = 0
         
-        # Filter strikes around ATM
         filtered_strikes = []
         for strike in sorted(strikes.keys()):
             if abs(strike - spot_price) <= (strike_gap * 12):
@@ -519,7 +455,6 @@ def create_option_chain_image(symbol, spot_price, expiry, option_data, market_da
                 total_ce_oi += ce.get('oi', 0)
                 total_pe_oi += pe.get('oi', 0)
         
-        # Image setup
         width = 800
         row_height = 25
         header_height = 100
@@ -530,7 +465,6 @@ def create_option_chain_image(symbol, spot_price, expiry, option_data, market_da
         img = Image.new('RGB', (width, height), color='#0a0a0a')
         draw = ImageDraw.Draw(img)
         
-        # Try to load font
         try:
             font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 16)
             font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14)
@@ -542,7 +476,6 @@ def create_option_chain_image(symbol, spot_price, expiry, option_data, market_da
             font_data = ImageFont.load_default()
             font_small = ImageFont.load_default()
         
-        # Header
         draw.rectangle([0, 0, width, header_height], fill='#1a1a1a')
         draw.text((width//2, 20), f"{symbol} OPTION CHAIN", fill='#00ff00', font=font_header, anchor='mt')
         draw.text((width//2, 50), f"Spot: ₹{spot_price:,.2f} | {expiry} | Lot: {lot_size}", 
@@ -550,7 +483,6 @@ def create_option_chain_image(symbol, spot_price, expiry, option_data, market_da
         draw.text((width//2, 75), f"Time: {time.strftime('%d-%b %H:%M:%S')}", 
                  fill='#888888', font=font_small, anchor='mt')
         
-        # Column headers
         y = header_height + 5
         draw.text((100, y), "CALL", fill='#26a69a', font=font_title, anchor='mt')
         draw.text((width//2, y), "STRIKE", fill='#ffffff', font=font_title, anchor='mt')
@@ -559,7 +491,6 @@ def create_option_chain_image(symbol, spot_price, expiry, option_data, market_da
         y += 25
         draw.line([(0, y), (width, y)], fill='#333333', width=2)
         
-        # Sub-headers
         y += 5
         draw.text((50, y), "OI", fill='#888888', font=font_small, anchor='mt')
         draw.text((150, y), "Vol", fill='#888888', font=font_small, anchor='mt')
@@ -571,16 +502,13 @@ def create_option_chain_image(symbol, spot_price, expiry, option_data, market_da
         
         y += 20
         
-        # Data rows
         for strike in filtered_strikes:
             ce = strikes[strike].get('CE', {})
             pe = strikes[strike].get('PE', {})
             
-            # Background for ATM
             if abs(strike - spot_price) <= strike_gap:
                 draw.rectangle([0, y, width, y + row_height], fill='#1a1a2e')
             
-            # CE data
             ce_oi = format_volume(ce.get('oi', 0)) if ce.get('oi', 0) > 0 else "-"
             ce_vol = format_volume(ce.get('volume', 0)) if ce.get('volume', 0) > 0 else "-"
             ce_ltp = f"{ce.get('ltp', 0):.0f}" if ce.get('ltp', 0) > 0 else "-"
@@ -589,11 +517,9 @@ def create_option_chain_image(symbol, spot_price, expiry, option_data, market_da
             draw.text((170, y + row_height//2), ce_vol, fill='#26a69a', font=font_data, anchor='mm')
             draw.text((250, y + row_height//2), ce_ltp, fill='#26a69a', font=font_data, anchor='mm')
             
-            # Strike
             strike_color = '#ffff00' if abs(strike - spot_price) <= strike_gap else '#ffffff'
             draw.text((width//2, y + row_height//2), f"{int(strike)}", fill=strike_color, font=font_data, anchor='mm')
             
-            # PE data
             pe_ltp = f"{pe.get('ltp', 0):.0f}" if pe.get('ltp', 0) > 0 else "-"
             pe_vol = format_volume(pe.get('volume', 0)) if pe.get('volume', 0) > 0 else "-"
             pe_oi = format_volume(pe.get('oi', 0)) if pe.get('oi', 0) > 0 else "-"
@@ -604,7 +530,6 @@ def create_option_chain_image(symbol, spot_price, expiry, option_data, market_da
             
             y += row_height
         
-        # Footer
         draw.line([(0, y), (width, y)], fill='#333333', width=2)
         y += 10
         
@@ -614,7 +539,6 @@ def create_option_chain_image(symbol, spot_price, expiry, option_data, market_da
         draw.text((width//2, y), f"Total OI - CE: {format_volume(total_ce_oi)} | PE: {format_volume(total_pe_oi)}", 
                  fill='#888888', font=font_small, anchor='mt')
         
-        # Convert to bytes
         buf = io.BytesIO()
         img.save(buf, format='PNG')
         buf.seek(0)
@@ -641,7 +565,6 @@ def bot_loop():
         logger.error("No instruments")
         return
     
-    # Find expiries
     expiries = {}
     for symbol, config in SYMBOLS_CONFIG.items():
         exp = find_nearest_expiry(instruments, symbol, config['exch_seg'], config['name_in_instruments'])
@@ -662,7 +585,6 @@ def bot_loop():
                     logger.warning(f"No expiry for {symbol}")
                     continue
                 
-                # Get spot price
                 spot_price = get_spot_price(smartApi, config['spot_token'], config['exchange'])
                 if spot_price == 0:
                     logger.warning(f"No spot for {symbol}")
@@ -670,20 +592,17 @@ def bot_loop():
                 
                 logger.info(f"Spot: ₹{spot_price:,.2f}")
                 
-                # ========== CANDLESTICK CHART ==========
+                # Candlestick Chart
                 logger.info(f"📊 Fetching candlestick data...")
                 candle_df = get_candlestick_data(
                     smartApi, 
                     config['spot_token'], 
                     config['exchange'],
                     config['candle_interval'],
-                    200  # Last 200 candles
+                    200
                 )
                 
                 if candle_df is not None and len(candle_df) > 0:
-                    logger.info(f"✅ Got {len(candle_df)} candles")
-                    
-                    # Create candlestick chart
                     candle_img = create_candlestick_chart(symbol, candle_df, spot_price)
                     
                     if candle_img:
@@ -694,15 +613,12 @@ def bot_loop():
                                         f"🕐 {time.strftime('%d-%b %H:%M')}")
                         
                         tele_send_photo(TELE_CHAT_ID, candle_img, candle_caption)
-                        logger.info(f"✅ Candlestick chart sent for {symbol}")
+                        logger.info(f"✅ Candlestick sent for {symbol}")
                         time.sleep(2)
-                else:
-                    logger.warning(f"No candlestick data for {symbol}")
                 
-                # ========== OPTION CHAIN ==========
+                # Option Chain
                 logger.info(f"🔗 Fetching option chain...")
                 
-                # Get option tokens
                 option_tokens = find_option_tokens(
                     instruments, symbol, expiries[symbol], spot_price,
                     config['strike_gap'], config['strikes_count'],
@@ -715,7 +631,6 @@ def bot_loop():
                 
                 logger.info(f"Found {len(option_tokens)} options")
                 
-                # Get market data
                 market_data = get_option_data(smartApi, option_tokens, config['exch_seg'])
                 
                 if not market_data:
@@ -724,7 +639,6 @@ def bot_loop():
                 
                 logger.info(f"Got data for {len(market_data)} tokens")
                 
-                # Create and send option chain PNG
                 oc_img = create_option_chain_image(
                     symbol, spot_price, expiries[symbol], option_tokens,
                     market_data, config['lot_size'], config['strike_gap']
@@ -740,7 +654,6 @@ def bot_loop():
                     logger.info(f"✅ Option chain sent for {symbol}")
                     time.sleep(3)
                 
-                # Delay between symbols
                 time.sleep(2)
             
             logger.info(f"✅ Iteration done. Sleep {POLL_INTERVAL}s...")
