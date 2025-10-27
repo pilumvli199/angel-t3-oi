@@ -34,49 +34,55 @@ REQUIRED = [API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET, TELE_TOKEN, TELE_CHAT_ID]
 
 app = Flask(__name__)
 
-# Symbol configurations - CORRECTED EXPIRY TYPES
+# Symbol configurations - CORRECTED based on NSE circular Oct 2024
 SYMBOLS_CONFIG = {
     'NIFTY': {
         'spot_token': '99926000',
         'exchange': 'NSE',
         'strike_gap': 50,
-        'expiry_type': 'weekly',  # Weekly - Thursday
-        'strikes_count': 21
+        'expiry_type': 'weekly',  # Weekly still available
+        'strikes_count': 21,
+        'lot_size': 25
     },
     'BANKNIFTY': {
         'spot_token': '99926009',
         'exchange': 'NSE',
         'strike_gap': 100,
-        'expiry_type': 'monthly',  # CORRECTED - Monthly, last Wednesday
-        'strikes_count': 21
+        'expiry_type': 'monthly',  # Weekly discontinued Oct 2024
+        'strikes_count': 21,
+        'lot_size': 15
     },
     'MIDCPNIFTY': {
         'spot_token': '99926037',
         'exchange': 'NSE',
         'strike_gap': 25,
-        'expiry_type': 'monthly',  # CORRECTED - Monthly
-        'strikes_count': 21
+        'expiry_type': 'monthly',  # Weekly discontinued Oct 2024
+        'strikes_count': 21,
+        'lot_size': 75
     },
     'FINNIFTY': {
         'spot_token': '99926074',
         'exchange': 'NSE',
         'strike_gap': 50,
-        'expiry_type': 'monthly',  # CORRECTED - Monthly
-        'strikes_count': 21
+        'expiry_type': 'monthly',  # Weekly discontinued Oct 2024
+        'strikes_count': 21,
+        'lot_size': 25
     },
     'SENSEX': {
         'spot_token': '99919000',
         'exchange': 'BSE',
         'strike_gap': 100,
-        'expiry_type': 'weekly',  # Weekly - Friday (BSE)
-        'strikes_count': 21
+        'expiry_type': 'weekly',  # BSE weekly still available
+        'strikes_count': 21,
+        'lot_size': 10
     },
     'HDFCBANK': {
         'spot_token': '1333',
         'exchange': 'NSE',
         'strike_gap': 20,
-        'expiry_type': 'monthly',  # Monthly - last Thursday
-        'strikes_count': 21
+        'expiry_type': 'monthly',
+        'strikes_count': 21,
+        'lot_size': 550
     }
 }
 
@@ -296,7 +302,7 @@ def get_option_ltp_oi_volume(smartApi, option_tokens):
                             'volume': int(item.get('tradeVolume', 0)),
                         }
             
-            time.sleep(0.2)  # Rate limiting
+            time.sleep(0.3)  # Rate limiting
         
         logger.info(f"✅ Fetched data for {len(result)} options")
         return result
@@ -306,7 +312,7 @@ def get_option_ltp_oi_volume(smartApi, option_tokens):
         return {}
 
 def get_option_greeks(smartApi, symbol, expiry):
-    """Fetch Option Greeks using Option Greeks API"""
+    """Fetch Option Greeks using Option Greeks API - with error handling"""
     try:
         logger.info(f"🔢 Fetching Greeks for {symbol} {expiry}...")
         
@@ -354,14 +360,19 @@ def get_option_greeks(smartApi, symbol, expiry):
                 logger.info(f"✅ Got Greeks for {len(greeks_data)} options")
                 return greeks_data
             else:
-                logger.warning(f"Greeks API error: {data.get('message')}")
+                # Don't log error for "No Data Available" - it's expected after market hours
+                msg = data.get('message', '')
+                if 'No Data Available' not in msg:
+                    logger.warning(f"Greeks API: {msg}")
+        elif response.status_code == 403:
+            logger.debug(f"Greeks API rate limited (403) - skipping")
         else:
-            logger.warning(f"Greeks API HTTP {response.status_code}")
+            logger.debug(f"Greeks API HTTP {response.status_code}")
         
         return {}
         
     except Exception as e:
-        logger.exception(f"❌ Failed to fetch Greeks: {e}")
+        logger.debug(f"Greeks fetch skipped: {e}")
         return {}
 
 def get_spot_prices(smartApi):
@@ -432,11 +443,21 @@ def get_spot_prices(smartApi):
         logger.exception(f"❌ Failed to fetch spot prices: {e}")
         return {}
 
-def format_option_chain_message(symbol, spot_price, expiry, option_data, market_data, greeks_data):
+def format_volume(vol):
+    """Format volume in readable format"""
+    if vol >= 10000000:  # 1 Crore
+        return f"{vol/10000000:.1f}Cr"
+    elif vol >= 100000:  # 1 Lakh
+        return f"{vol/100000:.1f}L"
+    elif vol >= 1000:
+        return f"{vol/1000:.0f}k"
+    return str(vol)
+
+def format_option_chain_message(symbol, spot_price, expiry, option_data, market_data, greeks_data, lot_size):
     """Format compact option chain message with all data"""
     messages = []
     messages.append(f"📊 <b>{symbol}</b>")
-    messages.append(f"💰 ₹{spot_price:,.1f} | 📅 {expiry}\n")
+    messages.append(f"💰 ₹{spot_price:,.1f} | 📅 {expiry} | Lot: {lot_size}\n")
     
     # Group by strike
     strikes = {}
@@ -469,9 +490,9 @@ def format_option_chain_message(symbol, spot_price, expiry, option_data, market_
         }
     
     # Compact header
-    messages.append("<code>CE Data      |Strike| PE Data</code>")
-    messages.append("<code>LTP OI  ΔOI |      |LTP OI  ΔOI</code>")
-    messages.append("─" * 38)
+    messages.append("<code>CE           |STRIKE|PE</code>")
+    messages.append("<code>LTP OI  Vol  |      |LTP OI  Vol</code>")
+    messages.append("─" * 40)
     
     total_ce_oi = 0
     total_pe_oi = 0
@@ -484,12 +505,10 @@ def format_option_chain_message(symbol, spot_price, expiry, option_data, market_
         
         ce_ltp = ce.get('ltp', 0)
         ce_oi = ce.get('oi', 0)
-        ce_chg = ce.get('oi_change', 0)
         ce_vol = ce.get('volume', 0)
         
         pe_ltp = pe.get('ltp', 0)
         pe_oi = pe.get('oi', 0)
-        pe_chg = pe.get('oi_change', 0)
         pe_vol = pe.get('volume', 0)
         
         total_ce_oi += ce_oi
@@ -498,37 +517,36 @@ def format_option_chain_message(symbol, spot_price, expiry, option_data, market_
         total_pe_vol += pe_vol
         
         # Format compact
-        def fmt_num(n):
-            if n >= 100000:
-                return f"{n//1000}k"
-            elif n >= 10000:
+        def fmt_oi(n):
+            if n >= 1000000:
                 return f"{n//1000}k"
             elif n >= 1000:
                 return f"{n//1000}k"
-            return str(int(n))
+            return str(int(n)) if n > 0 else "-"
         
-        ce_oi_str = fmt_num(ce_oi) if ce_oi > 0 else "-"
-        pe_oi_str = fmt_num(pe_oi) if pe_oi > 0 else "-"
+        ce_oi_str = fmt_oi(ce_oi)
+        pe_oi_str = fmt_oi(pe_oi)
         
-        ce_chg_str = f"+{fmt_num(ce_chg)}" if ce_chg > 100 else (f"-{fmt_num(abs(ce_chg))}" if ce_chg < -100 else "")
-        pe_chg_str = f"+{fmt_num(pe_chg)}" if pe_chg > 100 else (f"-{fmt_num(abs(pe_chg))}" if pe_chg < -100 else "")
+        ce_vol_str = format_volume(ce_vol) if ce_vol > 0 else "-"
+        pe_vol_str = format_volume(pe_vol) if pe_vol > 0 else "-"
         
-        ce_str = f"{ce_ltp:>3.0f} {ce_oi_str:>3} {ce_chg_str:>4}" if ce_ltp > 0 else "            "
-        pe_str = f"{pe_ltp:>3.0f} {pe_oi_str:>3} {pe_chg_str:>4}" if pe_ltp > 0 else "            "
+        ce_str = f"{ce_ltp:>3.0f} {ce_oi_str:>4} {ce_vol_str:>4}" if ce_ltp > 0 else "              "
+        pe_str = f"{pe_ltp:>3.0f} {pe_oi_str:>4} {pe_vol_str:>4}" if pe_ltp > 0 else "              "
         
         messages.append(f"<code>{ce_str}|{int(strike):>6}|{pe_str}</code>")
     
-    messages.append("─" * 38)
+    messages.append("─" * 40)
     
     # Summary
     if total_ce_oi > 0 or total_pe_oi > 0:
         pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
-        messages.append(f"<b>PCR:</b> {pcr:.2f} | CE OI: {total_ce_oi//1000}k PE OI: {total_pe_oi//1000}k")
+        messages.append(f"<b>PCR:</b> {pcr:.2f}")
+        messages.append(f"<b>OI:</b> CE {format_volume(total_ce_oi)} | PE {format_volume(total_pe_oi)}")
     
     if total_ce_vol > 0 or total_pe_vol > 0:
-        messages.append(f"<b>Vol:</b> CE {total_ce_vol:,} PE {total_pe_vol:,}")
+        messages.append(f"<b>Vol:</b> CE {format_volume(total_ce_vol)} | PE {format_volume(total_pe_vol)}")
     
-    messages.append(f"🕐 {time.strftime('%H:%M:%S')}")
+    messages.append(f"\n🕐 {time.strftime('%H:%M:%S')}")
     
     return "\n".join(messages)
 
@@ -566,7 +584,7 @@ def bot_loop():
             logger.error(f"❌ Could not find expiry for {symbol}")
     
     expiry_msg = "\n".join([f"📅 {sym}: {exp}" for sym, exp in expiries.items()])
-    tele_send_http(TELE_CHAT_ID, f"📅 <b>Expiries Found:</b>\n{expiry_msg}")
+    tele_send_http(TELE_CHAT_ID, f"📅 <b>Expiries Found:</b>\n{expiry_msg}\n\n🔄 Starting data fetch...")
     
     iteration = 0
     while True:
@@ -610,13 +628,16 @@ def bot_loop():
                 # Fetch market data (LTP, OI, Volume)
                 market_data = get_option_ltp_oi_volume(smartApi, option_tokens)
                 
-                # Fetch Greeks
-                greeks_data = get_option_greeks(smartApi, symbol, expiry)
+                # Try to fetch Greeks (may fail after market hours or due to rate limiting)
+                greeks_data = {}
+                if iteration % 3 == 1:  # Only try Greeks every 3rd iteration to avoid rate limits
+                    greeks_data = get_option_greeks(smartApi, symbol, expiry)
                 
                 if market_data:
                     msg = format_option_chain_message(
                         symbol, spot_price, expiry, 
-                        option_tokens, market_data, greeks_data
+                        option_tokens, market_data, greeks_data,
+                        config['lot_size']
                     )
                     tele_send_http(TELE_CHAT_ID, msg)
                     logger.info(f"✅ {symbol} data sent")
@@ -643,8 +664,9 @@ def index():
         'poll_interval': POLL_INTERVAL,
         'symbols': list(SYMBOLS_CONFIG.keys()),
         'smartapi_sdk_available': SmartConnect is not None,
-        'service': 'Angel One Enhanced Option Chain Bot v2',
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        'service': 'Angel One Enhanced Option Chain Bot v3',
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'note': 'BANKNIFTY, FINNIFTY, MIDCPNIFTY weekly expiry discontinued Oct 2024'
     }
     return jsonify(status)
 
