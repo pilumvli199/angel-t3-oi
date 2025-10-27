@@ -435,7 +435,7 @@ def format_nifty50_summary(stock_prices):
     
     return "\n".join(msg)
 
-def format_option_chain_detailed(symbol, spot_price, expiry, option_data, market_data, lot_size):
+def format_option_chain_detailed(symbol, spot_price, expiry, option_data, market_data, lot_size, strike_gap):
     """Format detailed option chain with volume and OI changes"""
     msg = []
     msg.append(f"📊 <b>{symbol} OPTION CHAIN</b>")
@@ -586,7 +586,10 @@ def bot_loop():
                 if option_tokens:
                     market_data = get_option_data(smartApi, option_tokens, config['exch_seg'])
                     if market_data:
-                        msg = format_option_chain_detailed(symbol, spot_price, expiry, option_tokens, market_data, config['lot_size'])
+                        msg = format_option_chain_detailed(
+                            symbol, spot_price, expiry, option_tokens, 
+                            market_data, config['lot_size'], config['strike_gap']
+                        )
                         tele_send_http(TELE_CHAT_ID, msg)
                         time.sleep(2)
             
