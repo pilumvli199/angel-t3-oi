@@ -8,6 +8,7 @@ import requests
 from datetime import datetime, timedelta
 from collections import defaultdict
 import pandas as pd
+import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -18,7 +19,7 @@ import io
 
 SmartConnect = None
 try:
-    from SmartApi import SmartConnect as _SC
+    from smartapi import SmartConnect as _SC
     SmartConnect = _SC
     logging.info("SmartConnect imported!")
 except Exception as e:
@@ -93,6 +94,17 @@ SYMBOLS_CONFIG = {
 }
 
 previous_oi = defaultdict(dict)
+
+def tele_send_message(chat_id: str, text: str):
+    """Send text message to Telegram"""
+    try:
+        url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
+        data = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
+        r = requests.post(url, data=data, timeout=30)
+        return r.status_code == 200
+    except Exception as e:
+        logger.exception(f'Message send failed: {e}')
+        return False
 
 def tele_send_photo(chat_id: str, photo_bytes: bytes, caption: str = ""):
     try:
@@ -306,6 +318,154 @@ def get_candlestick_data(smartApi, token, exchange, interval='FIVE_MINUTE', cand
         logger.exception(f"Candlestick fetch failed: {e}")
         return None
 
+def detect_candlestick_patterns(df):
+    """Detect candlestick patterns and return alerts"""
+    if df is None or len(df) < 3:
+        return []
+    
+    alerts = []
+    
+    # Get last 3 candles
+    last_candles = df.tail(3).reset_index(drop=True)
+    
+    if len(last_candles) < 3:
+        return alerts
+    
+    # Current candle (most recent)
+    c0 = last_candles.iloc[2]
+    c1 = last_candles.iloc[1]  # Previous
+    c2 = last_candles.iloc[0]  # 2 candles back
+    
+    # Calculate body and shadow sizes
+    c0_body = abs(c0['close'] - c0['open'])
+    c0_range = c0['high'] - c0['low']
+    c0_upper_shadow = c0['high'] - max(c0['open'], c0['close'])
+    c0_lower_shadow = min(c0['open'], c0['close']) - c0['low']
+    
+    c1_body = abs(c1['close'] - c1['open'])
+    c1_range = c1['high'] - c1['low']
+    
+    # 1. BULLISH ENGULFING
+    if (c1['close'] < c1['open'] and  # Previous red
+        c0['close'] > c0['open'] and  # Current green
+        c0['open'] < c1['close'] and  # Opens below prev close
+        c0['close'] > c1['open'] and  # Closes above prev open
+        c0_body > c1_body * 1.2):     # Bigger body
+        alerts.append({
+            'pattern': '🟢 BULLISH ENGULFING',
+            'signal': 'BUY',
+            'strength': 'Strong',
+            'description': 'Green candle engulfs previous red candle'
+        })
+    
+    # 2. BEARISH ENGULFING
+    if (c1['close'] > c1['open'] and  # Previous green
+        c0['close'] < c0['open'] and  # Current red
+        c0['open'] > c1['close'] and  # Opens above prev close
+        c0['close'] < c1['open'] and  # Closes below prev open
+        c0_body > c1_body * 1.2):     # Bigger body
+        alerts.append({
+            'pattern': '🔴 BEARISH ENGULFING',
+            'signal': 'SELL',
+            'strength': 'Strong',
+            'description': 'Red candle engulfs previous green candle'
+        })
+    
+    # 3. HAMMER (Bullish reversal)
+    if (c0_body > 0 and
+        c0_lower_shadow > c0_body * 2 and  # Long lower shadow
+        c0_upper_shadow < c0_body * 0.3 and  # Small upper shadow
+        c0['close'] > c0['open']):  # Green candle
+        alerts.append({
+            'pattern': '🔨 HAMMER',
+            'signal': 'BUY',
+            'strength': 'Medium',
+            'description': 'Bullish reversal - Long lower shadow'
+        })
+    
+    # 4. SHOOTING STAR (Bearish reversal)
+    if (c0_body > 0 and
+        c0_upper_shadow > c0_body * 2 and  # Long upper shadow
+        c0_lower_shadow < c0_body * 0.3 and  # Small lower shadow
+        c0['close'] < c0['open']):  # Red candle
+        alerts.append({
+            'pattern': '⭐ SHOOTING STAR',
+            'signal': 'SELL',
+            'strength': 'Medium',
+            'description': 'Bearish reversal - Long upper shadow'
+        })
+    
+    # 5. DOJI (Indecision)
+    if c0_body < c0_range * 0.1:  # Very small body
+        alerts.append({
+            'pattern': '➕ DOJI',
+            'signal': 'NEUTRAL',
+            'strength': 'Weak',
+            'description': 'Market indecision - Wait for confirmation'
+        })
+    
+    # 6. MORNING STAR (3-candle bullish reversal)
+    if (c2['close'] < c2['open'] and  # First red
+        abs(c1['close'] - c1['open']) < c1_range * 0.3 and  # Middle small body (star)
+        c0['close'] > c0['open'] and  # Last green
+        c0['close'] > (c2['open'] + c2['close']) / 2):  # Closes above midpoint of first
+        alerts.append({
+            'pattern': '🌅 MORNING STAR',
+            'signal': 'BUY',
+            'strength': 'Very Strong',
+            'description': 'Three-candle bullish reversal pattern'
+        })
+    
+    # 7. EVENING STAR (3-candle bearish reversal)
+    if (c2['close'] > c2['open'] and  # First green
+        abs(c1['close'] - c1['open']) < c1_range * 0.3 and  # Middle small body (star)
+        c0['close'] < c0['open'] and  # Last red
+        c0['close'] < (c2['open'] + c2['close']) / 2):  # Closes below midpoint of first
+        alerts.append({
+            'pattern': '🌇 EVENING STAR',
+            'signal': 'SELL',
+            'strength': 'Very Strong',
+            'description': 'Three-candle bearish reversal pattern'
+        })
+    
+    # 8. THREE WHITE SOLDIERS (Strong bullish)
+    if (len(last_candles) >= 3 and
+        all(c['close'] > c['open'] for _, c in last_candles.iterrows()) and  # All green
+        all(last_candles.iloc[i]['close'] > last_candles.iloc[i-1]['close'] 
+            for i in range(1, len(last_candles)))):  # Each closes higher
+        alerts.append({
+            'pattern': '⬆️⬆️⬆️ THREE WHITE SOLDIERS',
+            'signal': 'STRONG BUY',
+            'strength': 'Very Strong',
+            'description': 'Three consecutive bullish candles'
+        })
+    
+    # 9. THREE BLACK CROWS (Strong bearish)
+    if (len(last_candles) >= 3 and
+        all(c['close'] < c['open'] for _, c in last_candles.iterrows()) and  # All red
+        all(last_candles.iloc[i]['close'] < last_candles.iloc[i-1]['close'] 
+            for i in range(1, len(last_candles)))):  # Each closes lower
+        alerts.append({
+            'pattern': '⬇️⬇️⬇️ THREE BLACK CROWS',
+            'signal': 'STRONG SELL',
+            'strength': 'Very Strong',
+            'description': 'Three consecutive bearish candles'
+        })
+    
+    # 10. SPINNING TOP (Indecision with equal shadows)
+    if (c0_body > 0 and
+        c0_body < c0_range * 0.3 and  # Small body
+        c0_upper_shadow > c0_body * 0.8 and
+        c0_lower_shadow > c0_body * 0.8):  # Both shadows present
+        alerts.append({
+            'pattern': '🌀 SPINNING TOP',
+            'signal': 'NEUTRAL',
+            'strength': 'Weak',
+            'description': 'Indecision - Equal upper and lower shadows'
+        })
+    
+    return alerts
+
 def create_candlestick_chart(symbol, df, spot_price):
     """Create beautiful candlestick chart using pure matplotlib"""
     try:
@@ -364,7 +524,7 @@ def create_candlestick_chart(symbol, df, spot_price):
         for spine in ax1.spines.values():
             spine.set_color('#333333')
         
-        ax1.set_title(f'{symbol} - Last 200 Candles', 
+        ax1.set_title(f'{symbol} - Last 200 Candles (5min)', 
                      color='#00ff00', fontsize=16, fontweight='bold', pad=20)
         ax1.set_ylabel('Price (₹)', color='white', fontsize=12)
         ax1.legend(loc='upper left', facecolor='#1a1a1a', edgecolor='#333333', 
@@ -592,28 +752,49 @@ def bot_loop():
                 
                 logger.info(f"Spot: ₹{spot_price:,.2f}")
                 
-                # Candlestick Chart
-                logger.info(f"📊 Fetching candlestick data...")
+                # Candlestick Chart with Pattern Detection
+                logger.info(f"📊 Fetching candlestick data (200 candles, 5min)...")
                 candle_df = get_candlestick_data(
                     smartApi, 
                     config['spot_token'], 
                     config['exchange'],
-                    config['candle_interval'],
+                    'FIVE_MINUTE',
                     200
                 )
                 
                 if candle_df is not None and len(candle_df) > 0:
+                    # Detect patterns
+                    patterns = detect_candlestick_patterns(candle_df)
+                    
+                    # Create chart
                     candle_img = create_candlestick_chart(symbol, candle_df, spot_price)
                     
                     if candle_img:
                         candle_caption = (f"📈 {symbol} Candlestick Chart\n"
                                         f"💰 LTP: ₹{spot_price:,.2f}\n"
-                                        f"⏰ {config['candle_interval'].replace('_', ' ')}\n"
-                                        f"📊 {len(candle_df)} Candles\n"
+                                        f"⏰ 5 Minute Timeframe\n"
+                                        f"📊 Last 200 Candles\n"
                                         f"🕐 {time.strftime('%d-%b %H:%M')}")
                         
                         tele_send_photo(TELE_CHAT_ID, candle_img, candle_caption)
                         logger.info(f"✅ Candlestick sent for {symbol}")
+                        time.sleep(2)
+                    
+                    # Send pattern alerts if detected
+                    if patterns:
+                        alert_msg = f"🚨 <b>{symbol} PATTERN ALERTS</b> 🚨\n"
+                        alert_msg += f"💰 Price: ₹{spot_price:,.2f}\n"
+                        alert_msg += f"⏰ {time.strftime('%d-%b %H:%M:%S')}\n\n"
+                        
+                        for pattern in patterns:
+                            signal_emoji = '📈' if 'BUY' in pattern['signal'] else '📉' if 'SELL' in pattern['signal'] else '⚪'
+                            alert_msg += f"{signal_emoji} <b>{pattern['pattern']}</b>\n"
+                            alert_msg += f"   Signal: {pattern['signal']}\n"
+                            alert_msg += f"   Strength: {pattern['strength']}\n"
+                            alert_msg += f"   {pattern['description']}\n\n"
+                        
+                        tele_send_message(TELE_CHAT_ID, alert_msg)
+                        logger.info(f"✅ Pattern alerts sent: {len(patterns)} patterns")
                         time.sleep(2)
                 
                 # Option Chain
@@ -669,10 +850,23 @@ thread.start()
 @app.route('/')
 def index():
     return jsonify({
-        'service': 'Angel Option Chain + Candlestick Bot',
+        'service': 'Angel Option Chain + Candlestick Bot with Pattern Detection',
         'status': 'running',
         'symbols': list(SYMBOLS_CONFIG.keys()),
-        'features': ['Option Chain PNG', 'Candlestick Charts', 'Last 200 Candles'],
+        'features': [
+            'Option Chain PNG', 
+            'Candlestick Charts (5min timeframe)',
+            'Last 200 Candles',
+            'Pattern Detection (10+ patterns)',
+            'Automatic Telegram Alerts'
+        ],
+        'patterns_detected': [
+            'Bullish/Bearish Engulfing',
+            'Hammer & Shooting Star',
+            'Doji & Spinning Top',
+            'Morning/Evening Star',
+            'Three White Soldiers/Black Crows'
+        ],
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
     })
 
