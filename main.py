@@ -12,7 +12,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
-from mplfinance.original_flavor import candlestick_ohlc
 import matplotlib.dates as mdates
 from PIL import Image, ImageDraw, ImageFont
 import io
